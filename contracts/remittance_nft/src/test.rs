@@ -19,7 +19,7 @@ fn test_score_lifecycle() {
     let client = RemittanceNFTClient::new(&env, &contract_id);
 
     client.initialize(&admin);
-    assert_eq!(client.version(), 1);
+    assert_eq!(client.version(), 2);
 
     let history_hash = create_test_hash(&env, 1);
 
@@ -624,4 +624,98 @@ fn test_record_default_auto_burns_after_threshold() {
     assert!(client.get_metadata(&user).is_none());
     assert_eq!(client.get_score(&user), 0);
     assert!(!client.is_seized(&user));
+}
+
+#[test]
+fn test_transfer_moves_identity_state_to_new_wallet() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let old_wallet = Address::generate(&env);
+    let new_wallet = Address::generate(&env);
+
+    let contract_id = env.register(RemittanceNFT, ());
+    let client = RemittanceNFTClient::new(&env, &contract_id);
+
+    client.initialize(&admin);
+    client.mint(&old_wallet, &500, &create_test_hash(&env, 21), &None);
+    client.update_score(&old_wallet, &300, &None);
+    client.record_default(&old_wallet, &None);
+
+    client.transfer(&old_wallet, &new_wallet, &None);
+
+    assert!(client.get_metadata(&old_wallet).is_none());
+    assert_eq!(client.get_score(&old_wallet), 0);
+    assert_eq!(client.get_default_count(&old_wallet), 0);
+    assert!(!client.is_seized(&old_wallet));
+    assert_eq!(client.get_score_history(&old_wallet).len(), 0);
+
+    let metadata = client.get_metadata(&new_wallet).unwrap();
+    assert_eq!(metadata.score, 503);
+    assert_eq!(metadata.history_hash, create_test_hash(&env, 21));
+    assert_eq!(client.get_default_count(&new_wallet), 1);
+    assert!(client.is_seized(&new_wallet));
+    assert_eq!(client.get_score_history(&new_wallet).len(), 1);
+}
+
+#[test]
+#[should_panic(expected = "transfer cooldown active")]
+fn test_transfer_enforces_cooldown_before_retransfer() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let wallet_a = Address::generate(&env);
+    let wallet_b = Address::generate(&env);
+    let wallet_c = Address::generate(&env);
+
+    let contract_id = env.register(RemittanceNFT, ());
+    let client = RemittanceNFTClient::new(&env, &contract_id);
+
+    client.initialize(&admin);
+    client.mint(&wallet_a, &500, &create_test_hash(&env, 22), &None);
+    client.transfer(&wallet_a, &wallet_b, &None);
+
+    client.transfer(&wallet_b, &wallet_c, &None);
+}
+
+#[test]
+#[should_panic(expected = "destination address has existing remittance state")]
+fn test_transfer_rejects_destination_with_existing_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+
+    let contract_id = env.register(RemittanceNFT, ());
+    let client = RemittanceNFTClient::new(&env, &contract_id);
+
+    client.initialize(&admin);
+    client.mint(&from, &500, &create_test_hash(&env, 23), &None);
+    client.mint(&to, &450, &create_test_hash(&env, 24), &None);
+
+    client.transfer(&from, &to, &None);
+}
+
+#[test]
+#[should_panic(expected = "minter is not authorized")]
+fn test_transfer_rejects_unauthorized_minter() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+    let unauthorized_minter = Address::generate(&env);
+
+    let contract_id = env.register(RemittanceNFT, ());
+    let client = RemittanceNFTClient::new(&env, &contract_id);
+
+    client.initialize(&admin);
+    client.mint(&from, &500, &create_test_hash(&env, 25), &None);
+
+    client.transfer(&from, &to, &Some(unauthorized_minter));
 }

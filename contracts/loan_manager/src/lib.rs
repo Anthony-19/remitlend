@@ -63,6 +63,7 @@ pub enum DataKey {
     LateFeeRateBps,
     MinTermLedgers,
     MaxTermLedgers,
+    Collateral(u32),
 }
 
 #[contract]
@@ -76,7 +77,7 @@ impl LoanManager {
     const PERSISTENT_TTL_BUMP: u32 = 518400;
     const DEFAULT_INTEREST_RATE_BPS: u32 = 1200;
     const DEFAULT_TERM_LEDGERS: u32 = 17280;
-    const CURRENT_VERSION: u32 = 1;
+    const CURRENT_VERSION: u32 = 2;
     const DEFAULT_LATE_FEE_RATE_BPS: u32 = 500;
     const MAX_LATE_FEE_CAP_BPS: u32 = 2500;
     const DEFAULT_MAX_LOAN_AMOUNT: i128 = 50_000;
@@ -300,6 +301,60 @@ impl LoanManager {
             .and_then(|value| value.checked_add(loan.accrued_late_fee))
             .expect("debt overflow");
         (total_debt, late_fee_delta)
+    }
+
+    fn collateral_amount(env: &Env, loan_id: u32) -> i128 {
+        let key = DataKey::Collateral(loan_id);
+        let amount = env.storage().persistent().get(&key).unwrap_or(0i128);
+        if amount > 0 {
+            Self::bump_persistent_ttl(env, &key);
+        }
+        amount
+    }
+
+    fn release_collateral_internal(env: &Env, loan_id: u32, recipient: &Address) {
+        use soroban_sdk::token::TokenClient;
+
+        let collateral_key = DataKey::Collateral(loan_id);
+        let collateral = env.storage().persistent().get(&collateral_key).unwrap_or(0i128);
+        if collateral <= 0 {
+            return;
+        }
+
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("token not set");
+        let token_client = TokenClient::new(env, &token);
+        token_client.transfer(&env.current_contract_address(), recipient, &collateral);
+
+        env.storage().persistent().remove(&collateral_key);
+    }
+
+    fn seize_collateral_internal(env: &Env, loan_id: u32) {
+        use soroban_sdk::token::TokenClient;
+
+        let collateral_key = DataKey::Collateral(loan_id);
+        let collateral = env.storage().persistent().get(&collateral_key).unwrap_or(0i128);
+        if collateral <= 0 {
+            return;
+        }
+
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("token not set");
+        let lending_pool: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::LendingPool)
+            .expect("lending pool not set");
+        let token_client = TokenClient::new(env, &token);
+        token_client.transfer(&env.current_contract_address(), &lending_pool, &collateral);
+
+        env.storage().persistent().remove(&collateral_key);
     }
 
     pub fn initialize(
@@ -583,6 +638,7 @@ impl LoanManager {
         {
             loan.status = LoanStatus::Repaid;
             Self::decrement_borrower_loan_count(&env, &loan.borrower);
+            Self::release_collateral_internal(&env, loan_id, &loan.borrower);
         }
 
         env.storage().persistent().set(&loan_key, &loan);
@@ -599,6 +655,81 @@ impl LoanManager {
             events::late_fee_charged(&env, loan_id, late_fee_delta);
         }
         events::loan_repaid(&env, borrower, loan_id, amount);
+    }
+
+    pub fn deposit_collateral(env: Env, loan_id: u32, amount: i128) {
+        use soroban_sdk::token::TokenClient;
+
+        Self::assert_not_paused(&env);
+
+        if amount <= 0 {
+            panic!("collateral amount must be positive");
+        }
+
+        let loan_key = DataKey::Loan(loan_id);
+        let loan: Loan = env
+            .storage()
+            .persistent()
+            .get(&loan_key)
+            .expect("loan not found");
+        Self::bump_persistent_ttl(&env, &loan_key);
+
+        if loan.status != LoanStatus::Approved {
+            panic!("loan is not active");
+        }
+
+        loan.borrower.require_auth();
+
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("token not set");
+        let token_client = TokenClient::new(&env, &token);
+        token_client.transfer(&loan.borrower, &env.current_contract_address(), &amount);
+
+        let collateral_key = DataKey::Collateral(loan_id);
+        let existing_collateral = env
+            .storage()
+            .persistent()
+            .get::<DataKey, i128>(&collateral_key)
+            .unwrap_or(0);
+        let updated_collateral = existing_collateral
+            .checked_add(amount)
+            .expect("collateral overflow");
+        env.storage()
+            .persistent()
+            .set(&collateral_key, &updated_collateral);
+        Self::bump_persistent_ttl(&env, &collateral_key);
+
+        env.events().publish(
+            (symbol_short!("ColDep"), loan_id, loan.borrower),
+            updated_collateral,
+        );
+    }
+
+    pub fn release_collateral(env: Env, loan_id: u32) {
+        Self::assert_not_paused(&env);
+
+        let loan_key = DataKey::Loan(loan_id);
+        let loan: Loan = env
+            .storage()
+            .persistent()
+            .get(&loan_key)
+            .expect("loan not found");
+        Self::bump_persistent_ttl(&env, &loan_key);
+
+        if loan.status != LoanStatus::Repaid {
+            panic!("loan is not repaid");
+        }
+
+        Self::release_collateral_internal(&env, loan_id, &loan.borrower);
+        env.events()
+            .publish((symbol_short!("ColRel"), loan_id, loan.borrower), ());
+    }
+
+    pub fn get_collateral(env: Env, loan_id: u32) -> i128 {
+        Self::collateral_amount(&env, loan_id)
     }
 
     pub fn cancel_loan(env: Env, borrower: Address, loan_id: u32) {
@@ -866,6 +997,7 @@ impl LoanManager {
         env.storage().persistent().set(&loan_key, &loan);
         Self::bump_persistent_ttl(&env, &loan_key);
         Self::decrement_borrower_loan_count(&env, &loan.borrower);
+        Self::seize_collateral_internal(&env, loan_id);
 
         let nft_contract = Self::nft_contract(&env);
         let nft_client = NftClient::new(&env, &nft_contract);
@@ -899,6 +1031,7 @@ impl LoanManager {
             env.storage().persistent().set(&loan_key, &loan);
             Self::bump_persistent_ttl(&env, &loan_key);
             Self::decrement_borrower_loan_count(&env, &loan.borrower);
+            Self::seize_collateral_internal(&env, loan_id);
 
             let nft_contract = Self::nft_contract(&env);
             let nft_client = NftClient::new(&env, &nft_contract);
