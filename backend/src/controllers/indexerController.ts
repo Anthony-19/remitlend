@@ -1,6 +1,10 @@
 import type { Request, Response } from "express";
+import { xdr } from "@stellar/stellar-sdk";
 import { query } from "../db/connection.js";
-import { EventIndexer } from "../services/eventIndexer.js";
+import {
+  EventIndexer,
+  type SorobanRawEvent,
+} from "../services/eventIndexer.js";
 import { cacheService } from "../services/cacheService.js";
 import {
   SUPPORTED_WEBHOOK_EVENT_TYPES,
@@ -77,6 +81,97 @@ const buildEventsCacheKey = (
     `date:${req.query.date_range ?? "all"}`,
     `amount:${req.query.amount_range ?? "all"}`,
   ].join(":");
+
+type QuarantineEventRow = {
+  id: number;
+  event_id: string;
+  ledger: number;
+  tx_hash: string;
+  contract_id: string;
+  raw_xdr: unknown;
+  error_message: string;
+  quarantined_at: string;
+};
+
+const buildIndexerFromConfig = (): EventIndexer => {
+  const contractId = process.env.LOAN_MANAGER_CONTRACT_ID;
+
+  if (!contractId) {
+    throw new Error("LOAN_MANAGER_CONTRACT_ID is not configured");
+  }
+
+  const rpcUrl = getStellarRpcUrl();
+  const batchSize = Number(process.env.INDEXER_BATCH_SIZE ?? 100);
+
+  return new EventIndexer({
+    rpcUrl,
+    contractId,
+    pollIntervalMs: 30_000,
+    batchSize,
+  });
+};
+
+const decodeQuarantinedRawEvent = (
+  row: QuarantineEventRow,
+): SorobanRawEvent | null => {
+  const raw = row.raw_xdr;
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+
+  const candidate = raw as {
+    id?: unknown;
+    topics?: unknown;
+    value?: unknown;
+    ledger?: unknown;
+    ledgerClosedAt?: unknown;
+    txHash?: unknown;
+    contractId?: unknown;
+  };
+
+  if (!Array.isArray(candidate.topics) || typeof candidate.value !== "string") {
+    return null;
+  }
+
+  const topics = candidate.topics.filter(
+    (topic): topic is string => typeof topic === "string",
+  );
+
+  if (topics.length !== candidate.topics.length) {
+    return null;
+  }
+
+  try {
+    const topicValues = topics.map((topic) => xdr.ScVal.fromXDR(topic, "base64"));
+    const value = xdr.ScVal.fromXDR(candidate.value, "base64");
+    const ledgerClosedAt =
+      typeof candidate.ledgerClosedAt === "string"
+        ? candidate.ledgerClosedAt
+        : row.quarantined_at;
+
+    return {
+      id: row.event_id,
+      pagingToken: String(row.ledger),
+      topic: topicValues,
+      value,
+      ledger: row.ledger,
+      ledgerClosedAt,
+      txHash:
+        typeof candidate.txHash === "string" ? candidate.txHash : row.tx_hash,
+      contractId:
+        typeof candidate.contractId === "string"
+          ? candidate.contractId
+          : row.contract_id,
+    };
+  } catch (error) {
+    logger.warn("Failed to decode quarantined raw event", {
+      quarantineId: row.id,
+      eventId: row.event_id,
+      error,
+    });
+    return null;
+  }
+};
 
 /**
  * Get indexer status
@@ -547,23 +642,16 @@ export const reindexLedgerRange = async (req: Request, res: Response) => {
       });
     }
 
-    const contractId = process.env.LOAN_MANAGER_CONTRACT_ID;
-
-    if (!contractId) {
+    let indexer: EventIndexer;
+    try {
+      indexer = buildIndexerFromConfig();
+    } catch (error) {
+      logger.error("Failed to initialize indexer for reindex", { error });
       return res.status(500).json({
         success: false,
-        message: "LOAN_MANAGER_CONTRACT_ID is not configured",
+        message: "Indexer is not configured",
       });
     }
-
-    const rpcUrl = getStellarRpcUrl();
-    const batchSize = Number(process.env.INDEXER_BATCH_SIZE ?? 100);
-    const indexer = new EventIndexer({
-      rpcUrl,
-      contractId,
-      pollIntervalMs: 30_000,
-      batchSize,
-    });
 
     const result = await indexer.reindexRange(fromLedger, toLedger);
 
@@ -576,6 +664,160 @@ export const reindexLedgerRange = async (req: Request, res: Response) => {
     res.status(500).json({
       success: false,
       message: "Failed to reindex ledger range",
+    });
+  }
+};
+
+export const listQuarantinedEvents = async (req: Request, res: Response) => {
+  try {
+    const { limit, cursor } = parseCursorQueryParams(req);
+    const cursorValue = cursor ? Number.parseInt(cursor, 10) : null;
+
+    if (cursor && (!Number.isInteger(cursorValue) || (cursorValue ?? 0) <= 0)) {
+      return res.status(400).json({
+        success: false,
+        message: "cursor must be a positive integer",
+      });
+    }
+
+    const [result, countResult] = await Promise.all([
+      query(
+        `SELECT id, event_id, ledger, tx_hash, contract_id, raw_xdr, error_message, quarantined_at
+         FROM quarantine_events
+         WHERE ($1::int IS NULL OR id > $1)
+         ORDER BY id ASC
+         LIMIT $2`,
+        [cursorValue, limit + 1],
+      ),
+      query("SELECT COUNT(*)::int AS count FROM quarantine_events", []),
+    ]);
+
+    const hasNext = result.rows.length > limit;
+    const events = hasNext ? result.rows.slice(0, limit) : result.rows;
+    const lastEvent = events.length > 0 ? events[events.length - 1] : undefined;
+    const nextCursor = hasNext && lastEvent ? String(lastEvent.id) : null;
+
+    const response = createCursorPaginatedResponse(
+      {
+        events,
+      },
+      Number(countResult.rows[0]?.count ?? 0),
+      limit,
+      events.length,
+      nextCursor,
+      Boolean(cursor),
+    );
+
+    res.json(response);
+  } catch (error) {
+    logger.error("Failed to list quarantined events", { error });
+    res.status(500).json({
+      success: false,
+      message: "Failed to list quarantined events",
+    });
+  }
+};
+
+export const reprocessQuarantinedEvents = async (
+  req: Request,
+  res: Response,
+) => {
+  try {
+    const { ids, limit } = req.body as {
+      ids?: unknown;
+      limit?: unknown;
+    };
+
+    const parsedIds = Array.isArray(ids)
+      ? ids.filter((id): id is number => Number.isInteger(id) && id > 0)
+      : undefined;
+
+    if (Array.isArray(ids) && (!parsedIds || parsedIds.length !== ids.length)) {
+      return res.status(400).json({
+        success: false,
+        message: "ids must be an array of positive integers",
+      });
+    }
+
+    const parsedLimit =
+      typeof limit === "number" && Number.isInteger(limit) && limit > 0
+        ? Math.min(limit, 500)
+        : 50;
+
+    const rowsResult = parsedIds && parsedIds.length > 0
+      ? await query(
+          `SELECT id, event_id, ledger, tx_hash, contract_id, raw_xdr, error_message, quarantined_at
+           FROM quarantine_events
+           WHERE id = ANY($1::int[])
+           ORDER BY id ASC`,
+          [parsedIds],
+        )
+      : await query(
+          `SELECT id, event_id, ledger, tx_hash, contract_id, raw_xdr, error_message, quarantined_at
+           FROM quarantine_events
+           ORDER BY id ASC
+           LIMIT $1`,
+          [parsedLimit],
+        );
+
+    const rows = rowsResult.rows as QuarantineEventRow[];
+
+    let indexer: EventIndexer;
+    try {
+      indexer = buildIndexerFromConfig();
+    } catch (error) {
+      logger.error("Failed to initialize indexer for quarantine reprocess", {
+        error,
+      });
+      return res.status(500).json({
+        success: false,
+        message: "Indexer is not configured",
+      });
+    }
+
+    let deleted = 0;
+    let failed = 0;
+
+    for (const row of rows) {
+      try {
+        const rawEvent = decodeQuarantinedRawEvent(row);
+        if (!rawEvent || !indexer.isEventParseable(rawEvent)) {
+          failed += 1;
+          continue;
+        }
+
+        await indexer.ingestRawEvents([rawEvent]);
+        await query("DELETE FROM quarantine_events WHERE id = $1", [row.id]);
+        deleted += 1;
+      } catch (error) {
+        failed += 1;
+        logger.warn("Failed to reprocess quarantined event", {
+          quarantineId: row.id,
+          eventId: row.event_id,
+          error,
+        });
+      }
+    }
+
+    const remainingResult = await query(
+      "SELECT COUNT(*)::int AS count FROM quarantine_events",
+      [],
+    );
+
+    res.json({
+      success: true,
+      data: {
+        requested: rows.length,
+        reprocessed: deleted,
+        failed,
+        remaining: Number(remainingResult.rows[0]?.count ?? 0),
+      },
+    });
+  } catch (error) {
+    logger.error("Failed to reprocess quarantined events", { error });
+    res.status(500).json({
+      success: false,
+      message: "Failed to reprocess quarantined events",
     });
   }
 };

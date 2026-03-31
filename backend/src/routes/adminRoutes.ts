@@ -10,7 +10,9 @@ import {
   createWebhookSubscription,
   deleteWebhookSubscription,
   getWebhookDeliveries,
+  listQuarantinedEvents,
   listWebhookSubscriptions,
+  reprocessQuarantinedEvents,
   reindexLedgerRange,
 } from "../controllers/indexerController.js";
 
@@ -101,6 +103,66 @@ router.post(
   strictRateLimiter,
   auditLog,
   reindexLedgerRange,
+);
+
+/**
+ * @swagger
+ * /admin/quarantine-events:
+ *   get:
+ *     summary: List quarantined indexer events
+ *     tags: [Admin]
+ *     security:
+ *       - ApiKeyAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: limit
+ *         required: false
+ *         schema:
+ *           type: integer
+ *           default: 50
+ *       - in: query
+ *         name: cursor
+ *         required: false
+ *         schema:
+ *           type: integer
+ *     responses:
+ *       200:
+ *         description: Quarantined events retrieved
+ */
+router.get("/quarantine-events", requireApiKey, listQuarantinedEvents);
+
+/**
+ * @swagger
+ * /admin/quarantine-events/reprocess:
+ *   post:
+ *     summary: Reprocess quarantined indexer events
+ *     tags: [Admin]
+ *     security:
+ *       - ApiKeyAuth: []
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               ids:
+ *                 type: array
+ *                 items:
+ *                   type: integer
+ *               limit:
+ *                 type: integer
+ *                 default: 50
+ *     responses:
+ *       200:
+ *         description: Reprocess attempt completed
+ */
+router.post(
+  "/quarantine-events/reprocess",
+  requireApiKey,
+  strictRateLimiter,
+  auditLog,
+  reprocessQuarantinedEvents,
 );
 
 /**

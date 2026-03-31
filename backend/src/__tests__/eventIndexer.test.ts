@@ -22,6 +22,11 @@ const mockGetScoreConfig = jest.fn(() => ({
 const mockUpdateUserScoresBulk = jest
   .fn<(updates: Map<string, number>) => Promise<void>>()
   .mockResolvedValue(undefined);
+const mockLogger = {
+  info: jest.fn(),
+  warn: jest.fn(),
+  error: jest.fn(),
+};
 
 jest.unstable_mockModule("../db/connection.js", () => ({
   query: mockQuery,
@@ -50,11 +55,7 @@ jest.unstable_mockModule("../services/scoresService.js", () => ({
 }));
 
 jest.unstable_mockModule("../utils/logger.js", () => ({
-  default: {
-    info: jest.fn(),
-    warn: jest.fn(),
-    error: jest.fn(),
-  },
+  default: mockLogger,
 }));
 
 jest.unstable_mockModule("../utils/requestContext.js", () => ({
@@ -428,5 +429,77 @@ describe("EventIndexer", () => {
     await (indexer as unknown as { pollOnce: () => Promise<void> }).pollOnce();
 
     expect(stateWrites).toEqual([0, 15]);
+  });
+
+  it("quarantines parse failures and emits growth alert logs", async () => {
+    const previousThreshold = process.env.QUARANTINE_ALERT_THRESHOLD;
+    process.env.QUARANTINE_ALERT_THRESHOLD = "2";
+
+    mockQuery.mockImplementation(async (sql: string, params: unknown[] = []) => {
+      if (sql.includes("INSERT INTO quarantine_events")) {
+        return { rows: [], rowCount: 1 };
+      }
+
+      if (sql.includes("SELECT COUNT(*)::int AS count FROM quarantine_events")) {
+        return { rows: [{ count: 2 }], rowCount: 1 };
+      }
+
+      if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+        return { rows: [], rowCount: 0 };
+      }
+
+      if (sql.includes("INSERT INTO loan_events")) {
+        return { rows: [], rowCount: 0 };
+      }
+
+      return { rows: [], rowCount: 0 };
+    });
+
+    const indexer = new EventIndexer({
+      rpcUrl: "https://rpc.test",
+      contractId: "CINDEXERTEST",
+    });
+
+    const malformed = {
+      ...makeRawEvent({
+        id: "evt-malformed",
+        ledger: 42,
+        type: "LoanRequested",
+      }),
+      value: scSymbol("invalid-amount"),
+    };
+
+    (indexer as unknown as { rpc: { getEvents: unknown } }).rpc = {
+      getEvents: async () => ({
+        events: [malformed],
+      }),
+    };
+
+    await indexer.processEvents(42, 42);
+
+    expect(
+      mockQuery.mock.calls.some(([sql]) =>
+        String(sql).includes("INSERT INTO quarantine_events"),
+      ),
+    ).toBe(true);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      "Quarantine event count increased",
+      expect.objectContaining({
+        totalCount: 2,
+      }),
+    );
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      "Quarantine event count exceeded alert threshold",
+      expect.objectContaining({
+        threshold: 2,
+        totalCount: 2,
+      }),
+    );
+
+    if (previousThreshold === undefined) {
+      delete process.env.QUARANTINE_ALERT_THRESHOLD;
+    } else {
+      process.env.QUARANTINE_ALERT_THRESHOLD = previousThreshold;
+    }
   });
 });

@@ -18,7 +18,7 @@ import {
 import { sorobanService } from "./sorobanService.js";
 import { updateUserScoresBulk } from "./scoresService.js";
 
-interface SorobanRawEvent {
+export interface SorobanRawEvent {
   id: string;
   pagingToken: string;
   topic: xdr.ScVal[];
@@ -65,6 +65,8 @@ export class EventIndexer {
   private readonly contractId: string;
   private readonly pollIntervalMs: number;
   private readonly batchSize: number;
+  private readonly quarantineAlertThreshold: number;
+  private lastObservedQuarantineCount = 0;
   private running = false;
   private pollTimeout: NodeJS.Timeout | null = null;
 
@@ -74,6 +76,13 @@ export class EventIndexer {
     configOrRpcUrl: EventIndexerConfig | string,
     contractId?: string,
   ) {
+    const thresholdRaw = Number.parseInt(
+      process.env.QUARANTINE_ALERT_THRESHOLD ?? "25",
+      10,
+    );
+    this.quarantineAlertThreshold =
+      Number.isFinite(thresholdRaw) && thresholdRaw > 0 ? thresholdRaw : 25;
+
     if (typeof configOrRpcUrl === "string") {
       if (!contractId) {
         throw new Error("contractId is required when using rpcUrl constructor");
@@ -89,6 +98,18 @@ export class EventIndexer {
     this.contractId = configOrRpcUrl.contractId;
     this.pollIntervalMs = configOrRpcUrl.pollIntervalMs ?? 30_000;
     this.batchSize = configOrRpcUrl.batchSize ?? 100;
+  }
+
+  async ingestRawEvents(events: SorobanRawEvent[]): Promise<StoreEventsResult> {
+    return this.storeEvents(events);
+  }
+
+  isEventParseable(event: SorobanRawEvent): boolean {
+    try {
+      return this.parseEvent(event) !== null;
+    } catch {
+      return false;
+    }
   }
 
   async start(): Promise<void> {
@@ -346,6 +367,7 @@ export class EventIndexer {
     events: SorobanRawEvent[],
   ): Promise<StoreEventsResult> {
     const parsedEvents: LoanEvent[] = [];
+    let quarantineAttempts = 0;
 
     for (const event of events) {
       try {
@@ -358,8 +380,13 @@ export class EventIndexer {
           eventId: event.id,
           error,
         });
+        quarantineAttempts += 1;
         await this.quarantineEvent(event, error);
       }
+    }
+
+    if (quarantineAttempts > 0) {
+      await this.logQuarantineGrowth(quarantineAttempts);
     }
 
     if (parsedEvents.length === 0) {
@@ -650,6 +677,7 @@ export class EventIndexer {
       topics: rawTopics,
       value: rawValue,
       ledger: event.ledger,
+      ledgerClosedAt: event.ledgerClosedAt,
       txHash: event.txHash,
       contractId: event.contractId,
     };
@@ -681,6 +709,40 @@ export class EventIndexer {
         eventId: event.id,
         dbError,
       });
+    }
+  }
+
+  private async logQuarantineGrowth(newlyQuarantined: number): Promise<void> {
+    try {
+      const result = await query(
+        "SELECT COUNT(*)::int AS count FROM quarantine_events",
+        [],
+      );
+      const totalCount = Number(result.rows[0]?.count ?? 0);
+      const previousCount = this.lastObservedQuarantineCount;
+
+      if (totalCount > previousCount) {
+        logger.warn("Quarantine event count increased", {
+          previousCount,
+          totalCount,
+          delta: totalCount - previousCount,
+          newlyQuarantined,
+        });
+
+        if (
+          previousCount < this.quarantineAlertThreshold &&
+          totalCount >= this.quarantineAlertThreshold
+        ) {
+          logger.error("Quarantine event count exceeded alert threshold", {
+            threshold: this.quarantineAlertThreshold,
+            totalCount,
+          });
+        }
+      }
+
+      this.lastObservedQuarantineCount = Math.max(previousCount, totalCount);
+    } catch (error) {
+      logger.error("Failed to check quarantine event count", { error });
     }
   }
 
