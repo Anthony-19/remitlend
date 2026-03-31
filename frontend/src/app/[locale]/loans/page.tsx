@@ -5,12 +5,13 @@ import Link from "next/link";
 import { ArrowRight, CalendarRange, CircleDollarSign, ShieldCheck } from "lucide-react";
 import { ErrorBoundary } from "../../components/global_ui/ErrorBoundary";
 import { LoansListSkeleton } from "../../components/skeletons/LoansListSkeleton";
-import { useBorrowerLoans } from "../../hooks/useApi";
+import { useBorrowerLoans, useBorrowerLoansPage } from "../../hooks/useApi";
 import { LoanStatusBadge } from "../../components/ui/LoanStatusBadge";
+import { PaginationControls } from "../../components/ui/PaginationControls";
 import { useWalletStore, selectWalletAddress } from "../../stores/useWalletStore";
 import { useTranslations, useLocale } from "next-intl";
 
-const PAGE_SIZE = 6;
+const PAGE_SIZE = 20;
 
 function formatCurrency(value: number) {
   return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(value);
@@ -28,30 +29,31 @@ export default function LoansPage() {
   const locale = useLocale();
   const [activeTab, setActiveTab] = useState<"all" | "active" | "repaid" | "defaulted">("all");
   const [page, setPage] = useState(1);
+  const [pageCursors, setPageCursors] = useState<Record<number, string | null>>({ 1: null });
   const [now] = useState(() => Date.now());
   const address = useWalletStore(selectWalletAddress);
-  const { loans, stats, isLoading, isError } = useBorrowerLoans(address ?? undefined);
+  const { loans: allLoans, stats } = useBorrowerLoans(address ?? undefined);
+  const {
+    data: loansPage,
+    isLoading,
+    isError,
+  } = useBorrowerLoansPage(address ?? undefined, {
+    limit: PAGE_SIZE,
+    cursor: pageCursors[page] ?? null,
+    status: activeTab === "all" ? undefined : activeTab,
+  });
 
-  const filteredLoans = useMemo(() => {
-    const enriched = (loans || []).map((loan) => ({
+  const displayedLoans = useMemo(() => {
+    return (loansPage?.items ?? []).map((loan) => ({
       ...loan,
       displayStatus: getLoanDisplayStatus(loan.status, loan.nextPaymentDeadline, now),
     }));
+  }, [loansPage?.items, now]);
 
-    if (activeTab === "all") {
-      return enriched;
-    }
+  const knownPages = Object.keys(pageCursors).length;
+  const totalPages = Math.max(page, loansPage?.pageInfo.hasNext ? knownPages + 1 : knownPages);
 
-    return enriched.filter((loan) => loan.displayStatus === activeTab);
-  }, [activeTab, loans, now]);
-
-  const totalPages = Math.max(1, Math.ceil(filteredLoans.length / PAGE_SIZE));
-  const currentPage = Math.min(page, totalPages);
-  const paginatedLoans = filteredLoans.slice(
-    (currentPage - 1) * PAGE_SIZE,
-    currentPage * PAGE_SIZE,
-  );
-  const dueThisWeek = (loans || []).filter((loan) => {
+  const dueThisWeek = (allLoans || []).filter((loan) => {
     const dueAt = new Date(loan.nextPaymentDeadline).getTime();
     const sevenDays = 7 * 24 * 60 * 60 * 1000;
     return dueAt >= now && dueAt <= now + sevenDays;
@@ -138,6 +140,7 @@ export default function LoansPage() {
                 onClick={() => {
                   setActiveTab(tab.key as typeof activeTab);
                   setPage(1);
+                  setPageCursors({ 1: null });
                 }}
                 className={`rounded-full px-4 py-2 text-sm font-medium transition ${
                   activeTab === tab.key
@@ -150,7 +153,7 @@ export default function LoansPage() {
             ))}
           </div>
 
-          {paginatedLoans.length === 0 ? (
+          {displayedLoans.length === 0 ? (
             <div className="rounded-2xl border border-dashed border-zinc-300 px-6 py-10 text-center dark:border-zinc-700">
               <p className="text-base font-semibold text-zinc-900 dark:text-zinc-50">
                 {t("empty.title")}
@@ -168,7 +171,7 @@ export default function LoansPage() {
             </div>
           ) : (
             <div className="space-y-3">
-              {paginatedLoans.map((loan) => (
+              {displayedLoans.map((loan) => (
                 <article
                   key={loan.id}
                   className="flex flex-col gap-4 rounded-2xl border border-zinc-200 p-4 dark:border-zinc-800 md:flex-row md:items-center md:justify-between"
@@ -200,26 +203,38 @@ export default function LoansPage() {
             </div>
           )}
 
-          {paginatedLoans.length > 0 && totalPages > 1 && (
-            <div className="flex items-center justify-end gap-2 pt-2">
-              <button
-                onClick={() => setPage((prev) => Math.max(1, prev - 1))}
-                disabled={currentPage === 1}
-                className="rounded-full border border-zinc-300 px-3 py-1 text-sm disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-700"
-              >
-                {t("pagination.prev")}
-              </button>
-              <span className="text-sm text-zinc-600 dark:text-zinc-400">
-                {t("pagination.pageOf", { current: currentPage, total: totalPages })}
-              </span>
-              <button
-                onClick={() => setPage((prev) => Math.min(totalPages, prev + 1))}
-                disabled={currentPage === totalPages}
-                className="rounded-full border border-zinc-300 px-3 py-1 text-sm disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-700"
-              >
-                {t("pagination.next")}
-              </button>
-            </div>
+          {displayedLoans.length > 0 && (
+            <PaginationControls
+              currentPage={page}
+              totalPages={totalPages}
+              hasPrevious={page > 1}
+              hasNext={Boolean(loansPage?.pageInfo.hasNext)}
+              onPageChange={(nextPage) => {
+                if (nextPage <= totalPages && pageCursors[nextPage] !== undefined) {
+                  setPage(nextPage);
+                  return;
+                }
+
+                if (nextPage === page + 1 && loansPage?.pageInfo.nextCursor) {
+                  setPageCursors((current) => ({
+                    ...current,
+                    [nextPage]: loansPage.pageInfo.nextCursor,
+                  }));
+                  setPage(nextPage);
+                }
+              }}
+              onPrevious={() => setPage((previous) => Math.max(1, previous - 1))}
+              onNext={() => {
+                if (loansPage?.pageInfo.nextCursor) {
+                  setPageCursors((current) => ({
+                    ...current,
+                    [page + 1]: loansPage.pageInfo.nextCursor,
+                  }));
+                  setPage(page + 1);
+                }
+              }}
+              summary={t("pagination.pageOf", { current: page, total: totalPages })}
+            />
           )}
         </div>
       </ErrorBoundary>

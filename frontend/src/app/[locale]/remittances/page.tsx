@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useEffect, useState, useMemo } from "react";
 import {
   SendHorizontal,
   Filter,
@@ -18,10 +18,11 @@ import {
   selectIsWalletConnected,
   selectWalletAddress,
 } from "../../stores/useWalletStore";
-import { useRemittances, type Remittance } from "../../hooks/useApi";
+import { useRemittances, useRemittancesPage, type Remittance } from "../../hooks/useApi";
 import { Card, CardHeader, CardTitle, CardContent } from "../../components/ui/Card";
 import { ErrorBoundary } from "../../components/global_ui/ErrorBoundary";
 import { Spinner } from "../../components/global_ui/Spinner";
+import { PaginationControls } from "../../components/ui/PaginationControls";
 import Link from "next/link";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -65,6 +66,7 @@ const STATUS_CONFIG: Record<
 };
 
 type StatusFilter = "all" | Remittance["status"];
+const PAGE_SIZE = 20;
 
 // ─── Empty state ───────────────────────────────────────────────────────────────
 
@@ -119,15 +121,43 @@ export default function RemittancesPage() {
   const isConnected = useWalletStore(selectIsWalletConnected);
   const address = useWalletStore(selectWalletAddress);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [page, setPage] = useState(1);
+  const [pageCursors, setPageCursors] = useState<Record<number, string | null>>({ 1: null });
   const [searchQuery, setSearchQuery] = useState("");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const [minAmount, setMinAmount] = useState("");
   const [maxAmount, setMaxAmount] = useState("");
 
-  const [currentTimestamp] = useState(() => Date.now());
+  const hasAdvancedFilters = !!searchQuery || !!dateFrom || !!dateTo || !!minAmount || !!maxAmount;
+  const statusParam = statusFilter === "all" ? undefined : statusFilter;
 
-  const { data: remittances, isLoading, isError } = useRemittances({ enabled: isConnected });
+  const {
+    data: remittancesPage,
+    isLoading: pageLoading,
+    isError: pageError,
+  } = useRemittancesPage(
+    {
+      limit: PAGE_SIZE,
+      cursor: pageCursors[page] ?? null,
+      status: statusParam,
+    },
+    { enabled: isConnected && !hasAdvancedFilters },
+  );
+  const {
+    data: allRemittances,
+    isLoading: allLoading,
+    isError: allError,
+  } = useRemittances({ enabled: isConnected && hasAdvancedFilters });
+
+  const remittances = hasAdvancedFilters ? (allRemittances ?? []) : (remittancesPage?.items ?? []);
+  const isLoading = hasAdvancedFilters ? allLoading : pageLoading;
+  const isError = hasAdvancedFilters ? allError : pageError;
+
+  useEffect(() => {
+    setPage(1);
+    setPageCursors({ 1: null });
+  }, [statusFilter, searchQuery, dateFrom, dateTo, minAmount, maxAmount]);
 
   const filtered = useMemo(() => {
     if (!remittances) return [];
@@ -150,12 +180,11 @@ export default function RemittancesPage() {
     });
   }, [remittances, statusFilter, searchQuery, dateFrom, dateTo, minAmount, maxAmount]);
 
-  // ... inside RemittancesPage component
-
   const stats = useMemo(() => {
-    if (!remittances || remittances.length === 0) return null;
+    const statsSource = hasAdvancedFilters ? (allRemittances ?? []) : remittances;
+    if (statsSource.length === 0) return null;
 
-    const completed = remittances.filter((r) => r.status === "completed");
+    const completed = statsSource.filter((r) => r.status === "completed");
     const totalRemitted = completed.reduce((sum, r) => sum + r.amount, 0);
     const avgAmount = completed.length > 0 ? totalRemitted / completed.length : 0;
 
@@ -181,10 +210,23 @@ export default function RemittancesPage() {
       count: completed.length,
       frequency,
     };
-  }, [remittances]); // The "now" value only updates when remittances change
+  }, [allRemittances, hasAdvancedFilters, remittances]); // The "now" value only updates when remittances change
 
   const isFiltered =
     statusFilter !== "all" || !!searchQuery || !!dateFrom || !!dateTo || !!minAmount || !!maxAmount;
+
+  const totalPages = hasAdvancedFilters
+    ? Math.max(1, Math.ceil(filtered.length / PAGE_SIZE))
+    : Math.max(
+        page,
+        remittancesPage?.pageInfo.hasNext
+          ? Object.keys(pageCursors).length + 1
+          : Object.keys(pageCursors).length,
+      );
+
+  const visibleRemittances = hasAdvancedFilters
+    ? filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+    : filtered;
 
   if (!isConnected) return <ConnectWalletPrompt />;
 
@@ -403,7 +445,7 @@ export default function RemittancesPage() {
               </div>
 
               <div className="divide-y divide-zinc-100 dark:divide-zinc-800">
-                {filtered.map((r) => {
+                {visibleRemittances.map((r) => {
                   const cfg = STATUS_CONFIG[r.status];
                   const Icon = cfg.icon;
                   return (
@@ -451,11 +493,54 @@ export default function RemittancesPage() {
         </section>
       </ErrorBoundary>
 
-      {/* Footer count */}
       {!isLoading && !isError && filtered.length > 0 && (
-        <p className="text-xs text-zinc-400 dark:text-zinc-500 text-center">
-          Showing {filtered.length} of {remittances?.length ?? 0} remittances
-        </p>
+        <PaginationControls
+          currentPage={page}
+          totalPages={totalPages}
+          hasPrevious={page > 1}
+          hasNext={
+            hasAdvancedFilters ? page < totalPages : Boolean(remittancesPage?.pageInfo.hasNext)
+          }
+          onPageChange={(nextPage) => {
+            if (hasAdvancedFilters) {
+              setPage(nextPage);
+              return;
+            }
+
+            if (pageCursors[nextPage] !== undefined) {
+              setPage(nextPage);
+              return;
+            }
+
+            if (nextPage === page + 1 && remittancesPage?.pageInfo.nextCursor) {
+              setPageCursors((current) => ({
+                ...current,
+                [nextPage]: remittancesPage.pageInfo.nextCursor,
+              }));
+              setPage(nextPage);
+            }
+          }}
+          onPrevious={() => setPage((previous) => Math.max(1, previous - 1))}
+          onNext={() => {
+            if (hasAdvancedFilters) {
+              setPage((previous) => Math.min(totalPages, previous + 1));
+              return;
+            }
+
+            if (remittancesPage?.pageInfo.nextCursor) {
+              setPageCursors((current) => ({
+                ...current,
+                [page + 1]: remittancesPage.pageInfo.nextCursor,
+              }));
+              setPage(page + 1);
+            }
+          }}
+          summary={
+            hasAdvancedFilters
+              ? `Showing ${(page - 1) * PAGE_SIZE + 1}-${Math.min(page * PAGE_SIZE, filtered.length)} of ${filtered.length} remittances`
+              : `Showing page ${page}${remittancesPage?.pageInfo.total ? ` of ${totalPages}` : ""}`
+          }
+        />
       )}
     </main>
   );

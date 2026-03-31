@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMemo, useState } from "react";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import {
   Wallet,
   Copy,
@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { Card, CardHeader, CardTitle, CardContent } from "../../components/ui/Card";
 import { Button } from "../../components/ui/Button";
+import { PaginationControls } from "../../components/ui/PaginationControls";
 import { Spinner } from "../../components/global_ui/Spinner";
 import { TransactionsSkeleton } from "../../components/skeletons/TransactionsSkeleton";
 import { ErrorBoundary } from "../../components/global_ui/ErrorBoundary";
@@ -61,6 +62,7 @@ interface HorizonBalance {
 
 interface HorizonPayment {
   id: string;
+  paging_token: string;
   type: string;
   amount?: string;
   asset_type?: string;
@@ -70,6 +72,11 @@ interface HorizonPayment {
   transaction_hash: string;
   created_at: string;
   source_account?: string;
+}
+
+interface HorizonPaymentsPage {
+  records: HorizonPayment[];
+  nextCursor: string | null;
 }
 
 // ─── Horizon data hooks ────────────────────────────────────────────────────────
@@ -88,19 +95,38 @@ function useHorizonBalances(address: string, horizonUrl: string) {
   });
 }
 
-function useHorizonPayments(address: string, horizonUrl: string) {
-  return useQuery<HorizonPayment[]>({
-    queryKey: ["horizon", "payments", address, horizonUrl],
+const TRANSACTIONS_PER_PAGE = 20;
+
+function useHorizonPayments(address: string, horizonUrl: string, cursor: string | null) {
+  return useQuery<HorizonPaymentsPage>({
+    queryKey: ["horizon", "payments", address, horizonUrl, cursor],
     queryFn: async () => {
+      const queryParams = new URLSearchParams({
+        limit: String(TRANSACTIONS_PER_PAGE),
+        order: "desc",
+        include_failed: "false",
+      });
+
+      if (cursor) {
+        queryParams.set("cursor", cursor);
+      }
+
       const res = await fetch(
-        `${horizonUrl}/accounts/${address}/payments?limit=20&order=desc&include_failed=false`,
+        `${horizonUrl}/accounts/${address}/payments?${queryParams.toString()}`,
       );
       if (!res.ok) throw new Error(`Horizon returned ${res.status}`);
       const data = await res.json();
-      return (data._embedded?.records ?? []) as HorizonPayment[];
+      const records = (data._embedded?.records ?? []) as HorizonPayment[];
+      const lastRecord = records[records.length - 1];
+      return {
+        records,
+        nextCursor:
+          records.length === TRANSACTIONS_PER_PAGE ? (lastRecord?.paging_token ?? null) : null,
+      };
     },
     staleTime: 30_000,
     retry: 2,
+    placeholderData: keepPreviousData,
   });
 }
 
@@ -270,7 +296,18 @@ function TransactionHistoryCard({
   horizonUrl: string;
   explorerBase: string;
 }) {
-  const { data: payments, isLoading, isError } = useHorizonPayments(address, horizonUrl);
+  const [page, setPage] = useState(1);
+  const [pageCursors, setPageCursors] = useState<Record<number, string | null>>({ 1: null });
+  const { data, isLoading, isError } = useHorizonPayments(
+    address,
+    horizonUrl,
+    pageCursors[page] ?? null,
+  );
+  const payments = data?.records ?? [];
+  const totalPages = useMemo(() => {
+    const knownPages = Object.keys(pageCursors).length;
+    return Math.max(page, data?.nextCursor ? knownPages + 1 : knownPages);
+  }, [data?.nextCursor, page, pageCursors]);
 
   function isInflow(p: HorizonPayment): boolean {
     return p.to === address || (p.type === "create_account" && p.source_account !== address);
@@ -324,60 +361,94 @@ function TransactionHistoryCard({
             No transactions found.
           </p>
         ) : (
-          <div className="divide-y divide-zinc-100 dark:divide-zinc-800">
-            {payments.map((p) => (
-              <div key={p.id} className="flex items-center justify-between py-3 gap-4">
-                <div className="flex items-center gap-3 min-w-0">
-                  <div
-                    className={`h-9 w-9 rounded-full flex items-center justify-center flex-shrink-0 ${
-                      isInflow(p)
-                        ? "bg-green-50 dark:bg-green-500/10"
-                        : "bg-zinc-50 dark:bg-zinc-900"
-                    }`}
-                  >
-                    {isInflow(p) ? (
-                      <ArrowDownLeft className="h-4 w-4 text-green-600 dark:text-green-400" />
-                    ) : (
-                      <ArrowUpRight className="h-4 w-4 text-indigo-600 dark:text-indigo-400" />
-                    )}
-                  </div>
-                  <div className="min-w-0">
-                    <p className="text-sm font-semibold text-zinc-900 dark:text-zinc-50 truncate capitalize">
-                      {paymentLabel(p)}
-                    </p>
-                    <p className="text-xs text-zinc-500 dark:text-zinc-400 font-mono truncate">
-                      {counterparty(p)}
-                    </p>
-                  </div>
-                </div>
-                <div className="text-right flex-shrink-0 flex items-center gap-2">
-                  <div>
-                    <p
-                      className={`text-sm font-bold ${
+          <div className="space-y-4">
+            <div className="divide-y divide-zinc-100 dark:divide-zinc-800">
+              {payments.map((p) => (
+                <div key={p.id} className="flex items-center justify-between py-3 gap-4">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div
+                      className={`h-9 w-9 rounded-full flex items-center justify-center flex-shrink-0 ${
                         isInflow(p)
-                          ? "text-green-600 dark:text-green-400"
-                          : "text-zinc-900 dark:text-zinc-50"
+                          ? "bg-green-50 dark:bg-green-500/10"
+                          : "bg-zinc-50 dark:bg-zinc-900"
                       }`}
                     >
-                      {isInflow(p) ? "+" : "-"}
-                      {paymentAmount(p)}
-                    </p>
-                    <p className="text-xs text-zinc-400 dark:text-zinc-500">
-                      {formatDate(p.created_at)}
-                    </p>
+                      {isInflow(p) ? (
+                        <ArrowDownLeft className="h-4 w-4 text-green-600 dark:text-green-400" />
+                      ) : (
+                        <ArrowUpRight className="h-4 w-4 text-indigo-600 dark:text-indigo-400" />
+                      )}
+                    </div>
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold text-zinc-900 dark:text-zinc-50 truncate capitalize">
+                        {paymentLabel(p)}
+                      </p>
+                      <p className="text-xs text-zinc-500 dark:text-zinc-400 font-mono truncate">
+                        {counterparty(p)}
+                      </p>
+                    </div>
                   </div>
-                  <a
-                    href={`${explorerBase}/tx/${p.transaction_hash}`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="p-1 text-zinc-400 hover:text-indigo-600 dark:hover:text-indigo-400 transition-colors"
-                    title="View on Stellar Explorer"
-                  >
-                    <ExternalLink className="h-3.5 w-3.5" />
-                  </a>
+                  <div className="text-right flex-shrink-0 flex items-center gap-2">
+                    <div>
+                      <p
+                        className={`text-sm font-bold ${
+                          isInflow(p)
+                            ? "text-green-600 dark:text-green-400"
+                            : "text-zinc-900 dark:text-zinc-50"
+                        }`}
+                      >
+                        {isInflow(p) ? "+" : "-"}
+                        {paymentAmount(p)}
+                      </p>
+                      <p className="text-xs text-zinc-400 dark:text-zinc-500">
+                        {formatDate(p.created_at)}
+                      </p>
+                    </div>
+                    <a
+                      href={`${explorerBase}/tx/${p.transaction_hash}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="p-1 text-zinc-400 hover:text-indigo-600 dark:hover:text-indigo-400 transition-colors"
+                      title="View on Stellar Explorer"
+                    >
+                      <ExternalLink className="h-3.5 w-3.5" />
+                    </a>
+                  </div>
                 </div>
-              </div>
-            ))}
+              ))}
+            </div>
+
+            <PaginationControls
+              currentPage={page}
+              totalPages={totalPages}
+              hasPrevious={page > 1}
+              hasNext={Boolean(data?.nextCursor)}
+              onPageChange={(nextPage) => {
+                if (pageCursors[nextPage] !== undefined) {
+                  setPage(nextPage);
+                  return;
+                }
+
+                if (nextPage === page + 1 && data?.nextCursor) {
+                  setPageCursors((current) => ({
+                    ...current,
+                    [nextPage]: data.nextCursor,
+                  }));
+                  setPage(nextPage);
+                }
+              }}
+              onPrevious={() => setPage((previous) => Math.max(1, previous - 1))}
+              onNext={() => {
+                if (data?.nextCursor) {
+                  setPageCursors((current) => ({
+                    ...current,
+                    [page + 1]: data.nextCursor,
+                  }));
+                  setPage(page + 1);
+                }
+              }}
+              summary={`Showing ${payments.length} transactions on page ${page}`}
+            />
           </div>
         )}
       </CardContent>
