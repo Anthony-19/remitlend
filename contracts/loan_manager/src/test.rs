@@ -124,7 +124,8 @@ fn test_approve_loan_flow() {
     let env = Env::default();
     env.mock_all_auths_allowing_non_root_auth();
 
-    let (manager, nft_client, pool_client, token_id, _token_admin) = setup_test(&env);
+   let (manager, nft_client, _pool_client, token_id, _token_admin) = setup_test(&env);
+   let pool_contract_id = manager.get_pool_address(); 
     let borrower = Address::generate(&env);
 
     // 1. Give borrower a score high enough to pass
@@ -134,7 +135,7 @@ fn test_approve_loan_flow() {
     // 2. Setup liquidity - mint tokens to the pool address
     let token_client = TokenClient::new(&env, &token_id);
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client.address, &10000);
+    stellar_token.mint(&pool_contract_id, &10000);
 
     // 3. Request a loan
     let loan_id = manager.request_loan(&borrower, &1000);
@@ -315,7 +316,8 @@ fn test_configurable_interest_rate_and_default_term() {
     let env = Env::default();
     env.mock_all_auths_allowing_non_root_auth();
 
-    let (manager, nft_client, pool_client, token_id, _token_admin) = setup_test(&env);
+    let (manager, nft_client, _pool_client, token_id, _token_admin) = setup_test(&env);
+    let pool_contract_id = manager.get_pool_address();
     let borrower = Address::generate(&env);
 
     let history_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
@@ -325,7 +327,7 @@ fn test_configurable_interest_rate_and_default_term() {
     manager.set_default_term(&20_000);
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client.address, &10_000);
+    stellar_token.mint(&pool_contract_id, &10_000);
 
     let loan_id = manager.request_loan(&borrower, &1_000);
     let pending_loan = manager.get_loan(&loan_id);

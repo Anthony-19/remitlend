@@ -825,143 +825,139 @@ impl LoanManager {
         Ok(loan)
     }
 
-    pub fn repay(env: Env, borrower: Address, loan_id: u32, amount: i128) -> Result<(), LoanError> {
-        use soroban_sdk::token::TokenClient;
+pub fn repay(env: Env, borrower: Address, loan_id: u32, amount: i128) -> Result<(), LoanError> {
+    use soroban_sdk::token::TokenClient;
 
-        borrower.require_auth();
-        Self::require_not_paused(&env)?;
+    borrower.require_auth();
+    Self::require_not_paused(&env)?;
 
-        if amount <= 0 {
-            return Err(LoanError::InvalidAmount);
-        }
-
-        let loan_key = DataKey::Loan(loan_id);
-        let mut loan: Loan = env
-            .storage()
-            .persistent()
-            .get(&loan_key)
-            .ok_or(LoanError::LoanNotFound)?;
-        Self::bump_persistent_ttl(&env, &loan_key);
-
-        if loan.borrower != borrower {
-            return Err(LoanError::BorrowerMismatch);
-        }
-        if loan.status != LoanStatus::Approved {
-            return Err(LoanError::LoanNotActive);
-        }
-
-        let (total_debt, late_fee_delta) = Self::current_total_debt(&env, &mut loan);
-        if amount > total_debt {
-            return Err(LoanError::RepaymentExceedsDebt);
-        }
-
-        let min_repayment_amount = Self::min_repayment_amount(&env);
-        if amount < total_debt && amount < min_repayment_amount {
-            panic!("repayment amount below minimum");
-        }
-
-        let min_repayment_amount = Self::min_repayment_amount(&env);
-        if amount < total_debt && amount < min_repayment_amount {
-            panic!("repayment amount below minimum");
-        }
-
-        let token: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Token)
-            .expect("token not set");
-        let lending_pool: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::LendingPool)
-            .expect("lending pool not set");
-        let token_client = TokenClient::new(&env, &token);
-        token_client.transfer(&borrower, &lending_pool, &amount);
-
-        let (principal_payment, interest_payment, late_fee_payment) =
-            Self::proportional_repayment_split(&loan, amount);
-
-        loan.interest_paid = loan
-            .interest_paid
-            .checked_add(interest_payment)
-            .expect("interest paid overflow");
-        loan.accrued_interest = loan
-            .accrued_interest
-            .checked_sub(interest_payment)
-            .expect("interest underflow");
-        loan.late_fee_paid = loan
-            .late_fee_paid
-            .checked_add(late_fee_payment)
-            .expect("late fee paid overflow");
-        loan.accrued_late_fee = loan
-            .accrued_late_fee
-            .checked_sub(late_fee_payment)
-            .expect("late fee underflow");
-        loan.principal_paid = loan
-            .principal_paid
-            .checked_add(principal_payment)
-            .expect("principal paid overflow");
-
-        let was_late = env.ledger().sequence()
-            > loan
-                .due_date
-                .checked_add(Self::grace_period_ledgers(&env))
-                .expect("grace period overflow");
-
-        let mut completed = false;
-
-        // Check if loan is fully repaid (including rounding dust forgiveness)
-        let is_fully_repaid = loan.principal_paid == loan.amount
-            && loan.accrued_interest == 0
-            && loan.accrued_late_fee == 0;
-
-        // If this is rounding dust forgiveness, treat as full repayment
-        if is_rounding_dust_forgiveness && !is_fully_repaid {
-            // Forgive the remaining dust and mark as fully repaid
-            loan.accrued_interest = 0;
-            loan.accrued_late_fee = 0;
-            // Note: principal should already be fully paid or very close to it
-            if loan.principal_paid < loan.amount {
-                // Forgive any remaining principal dust (should be at most 1 unit)
-                loan.principal_paid = loan.amount;
-            }
-            completed = true;
-        } else if is_fully_repaid {
-            completed = true;
-        }
-
-        if completed {
-            loan.status = LoanStatus::Repaid;
-            loan.collateral_amount = 0;
-            Self::decrement_borrower_loan_count(&env, &loan.borrower);
-            Self::release_collateral_internal(&env, loan_id, &loan.borrower);
-        }
-
-        env.storage().persistent().set(&loan_key, &loan);
-        Self::bump_persistent_ttl(&env, &loan_key);
-        Self::bump_persistent_ttl(&env, &loan_key);
-
-        if amount >= 100 {
-            let nft_contract = Self::nft_contract(&env);
-            let nft_client = NftClient::new(&env, &nft_contract);
-            if completed && was_late {
-                nft_client.decrease_score(
-                    &borrower,
-                    &Self::LATE_REPAYMENT_SCORE_PENALTY.unsigned_abs(),
-                    &Some(env.current_contract_address()),
-                );
-            } else {
-                nft_client.update_score(&borrower, &amount, &Some(env.current_contract_address()));
-            }
-        }
-
-        if late_fee_delta > 0 {
-            events::late_fee_charged(&env, loan_id, late_fee_delta);
-        }
-        events::loan_repaid(&env, borrower, loan_id, amount);
-
-        Ok(())
+    if amount <= 0 {
+        return Err(LoanError::InvalidAmount);
     }
+
+    let loan_key = DataKey::Loan(loan_id);
+    let mut loan: Loan = env
+        .storage()
+        .persistent()
+        .get(&loan_key)
+        .ok_or(LoanError::LoanNotFound)?;
+    Self::bump_persistent_ttl(&env, &loan_key);
+
+    if loan.borrower != borrower {
+        return Err(LoanError::BorrowerMismatch);
+    }
+    if loan.status != LoanStatus::Approved {
+        return Err(LoanError::LoanNotActive);
+    }
+
+    let (total_debt, late_fee_delta) = Self::current_total_debt(&env, &mut loan);
+    if amount > total_debt {
+        return Err(LoanError::RepaymentExceedsDebt);
+    }
+
+    let min_repayment_amount = Self::min_repayment_amount(&env);
+
+    // Allow below-minimum repayment only when it fully clears the remaining debt
+    // or when the remaining debt itself is just small rounding dust.
+    let is_rounding_dust_forgiveness = total_debt <= min_repayment_amount;
+
+    if amount < total_debt && amount < min_repayment_amount && !is_rounding_dust_forgiveness {
+        panic!("repayment amount below minimum");
+    }
+
+    let token: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::Token)
+        .expect("token not set");
+    let lending_pool: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::LendingPool)
+        .expect("lending pool not set");
+    let token_client = TokenClient::new(&env, &token);
+    token_client.transfer(&borrower, &lending_pool, &amount);
+
+    let (principal_payment, interest_payment, late_fee_payment) =
+        Self::proportional_repayment_split(&loan, amount);
+
+    loan.interest_paid = loan
+        .interest_paid
+        .checked_add(interest_payment)
+        .expect("interest paid overflow");
+    loan.accrued_interest = loan
+        .accrued_interest
+        .checked_sub(interest_payment)
+        .expect("interest underflow");
+    loan.late_fee_paid = loan
+        .late_fee_paid
+        .checked_add(late_fee_payment)
+        .expect("late fee paid overflow");
+    loan.accrued_late_fee = loan
+        .accrued_late_fee
+        .checked_sub(late_fee_payment)
+        .expect("late fee underflow");
+    loan.principal_paid = loan
+        .principal_paid
+        .checked_add(principal_payment)
+        .expect("principal paid overflow");
+
+    let was_late = env.ledger().sequence()
+        > loan
+            .due_date
+            .checked_add(Self::grace_period_ledgers(&env))
+            .expect("grace period overflow");
+
+    let mut completed = false;
+
+    let is_fully_repaid = loan.principal_paid == loan.amount
+        && loan.accrued_interest == 0
+        && loan.accrued_late_fee == 0;
+
+    if is_rounding_dust_forgiveness && !is_fully_repaid {
+        loan.accrued_interest = 0;
+        loan.accrued_late_fee = 0;
+
+        if loan.principal_paid < loan.amount {
+            loan.principal_paid = loan.amount;
+        }
+
+        completed = true;
+    } else if is_fully_repaid {
+        completed = true;
+    }
+
+    if completed {
+        loan.status = LoanStatus::Repaid;
+        loan.collateral_amount = 0;
+        Self::decrement_borrower_loan_count(&env, &loan.borrower);
+        Self::release_collateral_internal(&env, loan_id, &loan.borrower);
+    }
+
+    env.storage().persistent().set(&loan_key, &loan);
+    Self::bump_persistent_ttl(&env, &loan_key);
+
+    if amount >= 100 {
+        let nft_contract = Self::nft_contract(&env);
+        let nft_client = NftClient::new(&env, &nft_contract);
+        if completed && was_late {
+            nft_client.decrease_score(
+                &borrower,
+                &Self::LATE_REPAYMENT_SCORE_PENALTY.unsigned_abs(),
+                &Some(env.current_contract_address()),
+            );
+        } else {
+            nft_client.update_score(&borrower, &amount, &Some(env.current_contract_address()));
+        }
+    }
+
+    if late_fee_delta > 0 {
+        events::late_fee_charged(&env, loan_id, late_fee_delta);
+    }
+    events::loan_repaid(&env, borrower, loan_id, amount);
+
+    Ok(())
+}
 
     pub fn deposit_collateral(env: Env, loan_id: u32, amount: i128) -> Result<(), LoanError> {
         use soroban_sdk::token::TokenClient;
