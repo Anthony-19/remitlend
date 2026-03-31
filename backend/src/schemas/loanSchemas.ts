@@ -1,10 +1,7 @@
 import { z } from "zod";
 import { stellarAddressSchema } from "./stellarSchemas.js";
 
-export const positiveAmountSchema = z.number({
-    required_error: "Amount is required",
-    invalid_type_error: "Amount must be a number"
-}).int().positive("Amount must be a positive integer");
+export const positiveAmountSchema = z.number().int().positive("Amount must be a positive integer");
 
 const base64Regex = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
@@ -24,27 +21,4 @@ export const repayLoanParamsSchema = z.object({
 
 export const submitTxSchema = z.object({
   signedTxXdr: z.string().min(1, "signedTxXdr is required").regex(base64Regex, "Must be a valid base64 string"),
-});
-
-import { z } from "zod";
-
-export const positiveAmountSchema = z.number({
-}).int().positive("Amount must be a positive integer");
-
-export const requestLoanSchema = z.object({
-  amount: positiveAmountSchema,
-  borrowerPublicKey: z.string().min(1, "borrowerPublicKey is required"),
-});
-
-export const repayLoanSchema = z.object({
-  amount: positiveAmountSchema,
-  borrowerPublicKey: z.string().min(1, "borrowerPublicKey is required"),
-});
-
-export const repayLoanParamsSchema = z.object({
-  loanId: z.coerce.number().int().positive("Loan ID must be a positive integer"),
-});
-
-export const submitTxSchema = z.object({
-  signedTxXdr: z.string().min(1, "signedTxXdr is required"),
 });
