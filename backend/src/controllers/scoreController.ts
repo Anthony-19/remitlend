@@ -184,7 +184,8 @@ export const getScoreBreakdown = asyncHandler(
            event_type,
            ledger,
            ledger_closed_at,
-           amount
+           amount,
+           term_ledgers
          FROM loan_events
          WHERE borrower = $1
        ),
@@ -193,7 +194,7 @@ export const getScoreBreakdown = asyncHandler(
          SELECT 
            loan_id,
            MAX(ledger) AS approved_ledger,
-           MAX(COALESCE(17280, 17280)) AS term_ledgers  -- default term if not present
+           MAX(COALESCE(term_ledgers, 17280)) AS term_ledgers
          FROM borrower_events
          WHERE event_type = 'LoanApproved' AND loan_id IS NOT NULL
          GROUP BY loan_id
@@ -291,22 +292,11 @@ export const getScoreBreakdown = asyncHandler(
 
     // Fetch detailed history for streak calculation (separate query is minimal overhead)
     const historyResult = await query(
-      `WITH 
-       borrower_events AS (
-         SELECT 
-           event_type,
-           ledger,
-           ledger_closed_at,
-           MAX(COALESCE(17280, 17280)) OVER (PARTITION BY loan_id ORDER BY ledger DESC) AS term_ledgers,
-           MAX(ledger) OVER (PARTITION BY loan_id ORDER BY ledger DESC) AS approval_ledger
-         FROM loan_events
-         WHERE borrower = $1 AND event_type IN ('LoanRepaid', 'LoanDefaulted', 'LoanApproved', 'LoanRequested')
-       )
-       SELECT 
+      `SELECT 
          event_type,
          ledger_closed_at
-       FROM borrower_events
-       WHERE event_type IN ('LoanRepaid', 'LoanDefaulted')
+       FROM loan_events
+       WHERE borrower = $1 AND event_type IN ('LoanRepaid', 'LoanDefaulted')
        ORDER BY ledger_closed_at ASC`,
       [userId],
     );
