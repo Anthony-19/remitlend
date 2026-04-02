@@ -1111,33 +1111,6 @@ fn test_set_default_burn_threshold_upper_bound_invalid() {
 }
 
 #[test]
-fn test_set_default_burn_threshold_upper_bound_valid() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let contract_id = env.register(RemittanceNFT, ());
-    let client = RemittanceNFTClient::new(&env, &contract_id);
-    client.initialize(&admin);
-
-    // Should succeed for valid threshold
-    client.set_default_burn_threshold(&RemittanceNFT::MAX_ALLOWED_BURN_THRESHOLD);
-}
-
-#[test]
-#[should_panic]
-fn test_set_default_burn_threshold_upper_bound_invalid() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let contract_id = env.register(RemittanceNFT, ());
-    let client = RemittanceNFTClient::new(&env, &contract_id);
-    client.initialize(&admin);
-
-    // Should panic for threshold above max
-    client.set_default_burn_threshold(&(RemittanceNFT::MAX_ALLOWED_BURN_THRESHOLD + 1));
-}
-
-#[test]
 fn test_remint_requires_approval() {
     let env = Env::default();
     env.mock_all_auths();

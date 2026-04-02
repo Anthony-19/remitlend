@@ -650,7 +650,6 @@ impl RemittanceNFT {
     /// This ensures that a seized borrower retains a path to clear
     /// their outstanding debt and avoid permanent bad-debt accumulation
     /// in the lending pool.
-
     pub fn seize_collateral(
         env: Env,
         user: Address,
